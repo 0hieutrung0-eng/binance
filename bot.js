@@ -1,10 +1,20 @@
 const fetch = require('node-fetch');
 const crypto = require('crypto');
+const http = require('http'); // Thêm thư viện http để tạo server mở port
 
 // ==================== CẤU HÌNH HỆ THỐNG ====================
 const API_KEY = "hTNtFqn7erbVjsKS4BXpDN1quZhST0zbUudHPRL5N56wnUQqvrLen4JdEbateuIi";
 const SECRET_KEY = "UGPd4K7Qw8qd5hIwBm0kekPhDpFEN2q9WJfBF6McevHrmMtNfDXcEXrotep74Nt";
 const BASE_URL = "https://fapi.binance.com";
+
+// 1. TẠO MỘT WEB SERVER GIẢ LẬP ĐỂ MỞ CỔNG (GIÚP RENDER KHÔNG BÁO LỖI NO OPEN PORTS)
+const PORT = process.env.PORT || 3000;
+http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Bot Binance Futures is running 24/7!\n');
+}).listen(PORT, () => {
+    console.log(`🌐 Server giả lập đang mở tại cổng ${PORT}`);
+});
 
 // Hàm tạo chữ ký HMAC SHA256
 function generateSignature(queryString, secretKey) {
@@ -41,7 +51,6 @@ async function callBinanceAPI(endpoint, method = 'GET', payload = null, isSigned
 
     let options = { method, headers };
 
-    // Thử lại tối đa 3 lần nếu lỗi mạng
     for (let attempt = 1; attempt <= 3; attempt++) {
         try {
             let response = await fetch(url, options);
@@ -98,7 +107,6 @@ async function runBot() {
     try {
         console.log("\n==================== BẮT ĐẦU QUÉT VÀ LỌC THỊ TRƯỜNG ====================");
 
-        // 1. Kiểm tra lệnh treo
         let positions = await callBinanceAPI("/fapi/v2/positionRisk", "GET", null, true);
         if (Array.isArray(positions)) {
             let activePositions = positions.filter(pos => parseFloat(pos.positionAmt) !== 0);
@@ -108,7 +116,6 @@ async function runBot() {
             }
         }
 
-        // 2. Danh sách coin thanh khoản cao
         let symbolsList = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "AVAXUSDT", "LINKUSDT", "SUIUSDT"];
         console.log("🔍 Đang quét và phân tích chỉ báo (RSI, Volume 5m, Trend 1h/1d)...");
 
@@ -156,7 +163,6 @@ async function runBot() {
 
         console.log(`🎯 TÌM THẤY COIN: ${bestTarget.symbol} | Hướng: ${bestTarget.action} | Giá: ${bestTarget.currentPrice} | RSI: ${bestTarget.rsi.toFixed(2)}`);
 
-        // 3. Kiểm tra số dư ví
         let account = await callBinanceAPI("/fapi/v2/account", "GET", null, true);
         let usdtWallet = 0;
         if (account && account.assets) {
@@ -174,18 +180,16 @@ async function runBot() {
         let allocationPercent = (side === "BUY") ? 0.95 : 0.50;
         let leverage = 1;
         let capitalToUse = usdtWallet * allocationPercent * leverage;
-        let quantity = parseFloat((capitalToUse / currentPrice).toFixed(3));
+        let quantity = parseFloat((capitalToUser / currentPrice).toFixed(3));
         let tpPrice = (side === "BUY") ? currentPrice * 1.02 : currentPrice * 0.98;
 
         console.log("==================== THỰC THI KHỚP LỆNH ====================");
         console.log(`💼 Vốn phân bổ: ${capitalToUse.toFixed(2)} USDT | Khối lượng: ${quantity} | TP: ${tpPrice.toFixed(4)}`);
 
-        // Đặt lệnh Market
         let orderPayload = { symbol, side, type: "MARKET", quantity };
         let marketRes = await callBinanceAPI("/fapi/v1/order", "POST", orderPayload, true);
         console.log("✅ Kết quả Market Order:", JSON.stringify(marketRes));
 
-        // Đặt lệnh Take Profit
         let tpSide = (side === "BUY") ? "SELL" : "BUY";
         let tpPayload = { symbol, side: tpSide, type: "TAKE_PROFIT_MARKET", stopPrice: tpPrice.toFixed(4), closePosition: "true" };
         let tpRes = await callBinanceAPI("/fapi/v1/order", "POST", tpPayload, true);
@@ -197,7 +201,7 @@ async function runBot() {
     }
 }
 
-// Chạy định kỳ 5 phút một lần (300000 ms)
-console.log("🚀 Bot Binance Futures đã khởi động và sẽ chạy tự động mỗi 5 phút...");
+// Chạy định kỳ 5 phút một lần
+console.log("🚀 Bot Binance Futures đã khởi động...");
 runBot();
 setInterval(runBot, 5 * 60 * 1000);
