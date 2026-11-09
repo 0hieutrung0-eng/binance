@@ -1,255 +1,511 @@
-const fetch = require('node-fetch');
-const crypto = require('crypto');
-const http = require('http');
+import time
+import math
+import os
+from binance.client import Client
+from binance.exceptions import BinanceAPIException
 
-// ==================== CẤU HÌNH HỆ THỐNG ====================
-const API_KEY = "hTNtFqn7erbVjsKS4BXpDN1quZhST0zbUudHPRL5N56wnUQqvrLen4JdEbateuIi";
-const SECRET_KEY = "UGPd4K7Qw8qd5hIwBm0kekPhDpFEN2q9WJfBF6McevHrmMtNfDXcEXrotep74Nt";
-const BASE_URL = "https://fapi.binance.com";
+# ==========================================
+# 1. CẤU HÌNH
+# ==========================================
+API_KEY = "hTNtFqn7erbVjsKS4BXpDN1quZhST0zbUudHPRL5N56wnUQqvrLen4JdEbateuIi"
+API_SECRET = "UGPd4K7Qw8qd5hIwBm0kekPhDpFEN2q9WJfBF6McevHrmMtNfDXcEXrotep74Nt"
 
-// TẠO HTTP SERVER BẮT ĐÚNG PORT CỦA RENDER (Tránh lỗi No open ports)
-const server = http.createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Bot Binance Futures is running 24/7 with detailed error logs!\n');
-});
+USE_TESTNET = False
+LEVERAGE = 5
+MARGIN_PER_TRADE = 2.0
 
-const PORT = process.env.PORT || 10000;
-server.listen(PORT, () => {
-    console.log(`🌐 Server đang lắng nghe tại cổng ${PORT}`);
-});
+MAX_ACTIVE_TRADES = 5
 
-// Hàm tạo chữ ký HMAC SHA256
-function generateSignature(queryString, secretKey) {
-    return crypto
-        .createHmac('sha256', secretKey)
-        .update(queryString)
-        .digest('hex');
-}
+PROFIT_PERCENT = 0.03
+LOSS_PERCENT = 0.03
+BREAK_EVEN_TRIGGER = 0.006
 
-// Hàm gọi API Binance có log lỗi chi tiết HTTP Status
-async function callBinanceAPI(endpoint, method = 'GET', payload = null, isSigned = false) {
-    let url = BASE_URL + endpoint;
-    let headers = { "X-MBX-APIKEY": API_KEY };
+TRADE_MODE = "NORMAL"
 
-    if (isSigned) {
-        let timestamp = Date.now();
-        let queryString = `timestamp=${timestamp}`;
-        if (payload) {
-            for (let key in payload) {
-                queryString += `&${key}=${encodeURIComponent(payload[key])}`;
+ST_PERIOD = 10
+ST_MULTIPLIER = 3.0
+RSI_PERIOD = 14
+EMA_FAST = 8
+EMA_SLOW = 21
+
+ENTRY_INTERVAL = "5m"
+HTF_INTERVAL = "15m"
+
+SYMBOL_PRECISION_CACHE = {}
+LAST_TRADE_TIME = {}
+
+
+# ==========================================
+# 2. HÀM CƠ BẢN
+# ==========================================
+def clear_screen():
+    os.system('cls' if os.name == 'nt' else 'clear')
+
+
+def load_symbol_precisions(client):
+    global SYMBOL_PRECISION_CACHE
+    try:
+        info = client.futures_exchange_info()
+        for s in info['symbols']:
+            for f in s['filters']:
+                if f['filterType'] == 'LOT_SIZE':
+                    step = float(f['stepSize'])
+                    precision = len(str(step).rstrip('0').split('.')[-1]) if '.' in str(step) else 0
+                    SYMBOL_PRECISION_CACHE[s['symbol']] = precision
+        print("[INIT] Đã tải Lot Size thành công")
+    except Exception as e:
+        print(f"[LỖI PRECISION] {e}")
+
+
+def floor_precision(val, precision):
+    factor = 10 ** precision
+    return math.floor(val * factor) / factor
+
+
+def get_max_leverage(client, symbol):
+    try:
+        brackets = client.futures_leverage_bracket(symbol=symbol)
+        return int(brackets[0]['brackets'][0]['initialLeverage'])
+    except:
+        return 5
+
+
+def is_hedge_mode(client):
+    try:
+        return client.futures_get_position_mode().get('dualSidePosition', False)
+    except:
+        return False
+
+
+def get_usdt_balances(client):
+    try:
+        acc = client.futures_account()
+        for a in acc['assets']:
+            if a['asset'] == 'USDT':
+                return {
+                    'wallet': float(a['walletBalance']),
+                    'available': float(a['availableBalance']),
+                    'unrealized': float(a.get('unrealizedProfit', 0))
+                }
+    except:
+        pass
+    return {'wallet': 0.0, 'available': 0.0, 'unrealized': 0.0}
+
+
+# ==========================================
+# 3. CHỈ BÁO
+# ==========================================
+def ema(data, period):
+    if len(data) < period:
+        return [data[-1]] * len(data)
+    k = 2 / (period + 1)
+    result = [sum(data[:period]) / period]
+    for price in data[period:]:
+        result.append(price * k + result[-1] * (1 - k))
+    return result
+
+
+def rsi(closes, period=14):
+    if len(closes) < period + 1:
+        return 50.0
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i-1]
+        gains.append(max(diff, 0))
+        losses.append(max(-diff, 0))
+
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def supertrend(highs, lows, closes, period=10, multiplier=3.0):
+    n = len(closes)
+    if n < period + 2:
+        return None
+
+    atr_values = []
+    for i in range(1, n):
+        tr = max(highs[i] - lows[i],
+                 abs(highs[i] - closes[i-1]),
+                 abs(lows[i] - closes[i-1]))
+        atr_values.append(tr)
+
+    atr_series = []
+    for i in range(len(atr_values)):
+        if i < period - 1:
+            atr_series.append(sum(atr_values[:i+1]) / (i+1))
+        else:
+            atr_series.append(sum(atr_values[i-period+1:i+1]) / period)
+
+    hl2 = [(highs[i] + lows[i]) / 2 for i in range(n)]
+    final_upper = [0.0] * n
+    final_lower = [0.0] * n
+    direction = [1] * n
+
+    for i in range(period, n):
+        basic_upper = hl2[i] + multiplier * atr_series[i-1]
+        basic_lower = hl2[i] - multiplier * atr_series[i-1]
+
+        if i == period:
+            final_upper[i] = basic_upper
+            final_lower[i] = basic_lower
+            direction[i] = 1 if closes[i] > basic_upper else -1
+            continue
+
+        final_upper[i] = basic_upper if (basic_upper < final_upper[i-1] or closes[i-1] > final_upper[i-1]) else final_upper[i-1]
+        final_lower[i] = basic_lower if (basic_lower > final_lower[i-1] or closes[i-1] < final_lower[i-1]) else final_lower[i-1]
+
+        if direction[i-1] == 1:
+            direction[i] = -1 if closes[i] < final_lower[i] else 1
+        else:
+            direction[i] = 1 if closes[i] > final_upper[i] else -1
+
+    return 'LONG' if direction[-1] == 1 else 'SHORT'
+
+
+def check_higher_timeframe_trend(client, symbol):
+    try:
+        klines = client.futures_klines(symbol=symbol, interval=HTF_INTERVAL, limit=40)
+        closes = [float(k[4]) for k in klines]
+        highs = [float(k[2]) for k in klines]
+        lows = [float(k[3]) for k in klines]
+        return supertrend(highs, lows, closes, ST_PERIOD, ST_MULTIPLIER)
+    except:
+        return None
+
+
+def decide_direction(client, symbol):
+    try:
+        now = time.time()
+        if symbol in LAST_TRADE_TIME and now - LAST_TRADE_TIME[symbol] < 45:
+            return None
+
+        klines = client.futures_klines(symbol=symbol, interval=ENTRY_INTERVAL, limit=60)
+        closes = [float(k[4]) for k in klines]
+        highs = [float(k[2]) for k in klines]
+        lows = [float(k[3]) for k in klines]
+        volumes = [float(k[5]) for k in klines]
+
+        avg_vol = sum(volumes[-15:-1]) / 14
+        if volumes[-1] < avg_vol * 1.05:
+            return None
+
+        st_dir = supertrend(highs, lows, closes, ST_PERIOD, ST_MULTIPLIER)
+        if st_dir is None:
+            return None
+
+        htf_dir = check_higher_timeframe_trend(client, symbol)
+
+        current_rsi = rsi(closes, RSI_PERIOD)
+        ema_fast = ema(closes, EMA_FAST)[-1]
+        ema_slow = ema(closes, EMA_SLOW)[-1]
+        ema_bullish = ema_fast > ema_slow
+
+        raw_signal = None
+
+        if st_dir == 'LONG' and 28 < current_rsi < 72:
+            if ema_bullish or (htf_dir == 'LONG'):
+                raw_signal = 'LONG'
+        elif st_dir == 'SHORT' and 28 < current_rsi < 72:
+            if (not ema_bullish) or (htf_dir == 'SHORT'):
+                raw_signal = 'SHORT'
+
+        if raw_signal is None:
+            return None
+
+        if TRADE_MODE == "REVERSE":
+            final = 'SHORT' if raw_signal == 'LONG' else 'LONG'
+            print(f"   [ĐẢO NGƯỢC] {symbol} | {raw_signal} → {final} | RSI: {current_rsi:.1f}")
+            return final
+        else:
+            print(f"   [TÍN HIỆU] {symbol} | {raw_signal} | RSI: {current_rsi:.1f} | HTF: {htf_dir}")
+            return raw_signal
+
+    except Exception as e:
+        return None
+
+
+# ==========================================
+# 4. MỞ LỆNH (BẮT BUỘC TP + SL)
+# ==========================================
+def open_position(client, symbol, direction, hedge_mode):
+    try:
+        balances = get_usdt_balances(client)
+        if balances['available'] < MARGIN_PER_TRADE:
+            return False
+
+        try:
+            client.futures_change_margin_type(symbol=symbol, marginType="ISOLATED")
+        except:
+            pass
+
+        max_lev = get_max_leverage(client, symbol)
+        lev = min(LEVERAGE, max_lev)
+        if lev < 5:
+            return False
+
+        client.futures_change_leverage(symbol=symbol, leverage=lev)
+
+        price = float(client.futures_symbol_ticker(symbol=symbol)['price'])
+        prec = SYMBOL_PRECISION_CACHE.get(symbol, 3)
+
+        notional = MARGIN_PER_TRADE * lev
+        qty = floor_precision(notional / price, prec)
+        if qty <= 0:
+            return False
+
+        effective_margin = (qty * price) / lev
+        if effective_margin < MARGIN_PER_TRADE * 0.87:
+            return False
+
+        if direction == 'LONG':
+            side = 'BUY'
+            pos_side = 'LONG'
+            tp_price = round(price * (1 + PROFIT_PERCENT), 6)
+            sl_price = round(price * (1 - LOSS_PERCENT), 6)
+            close_side = 'SELL'
+        else:
+            side = 'SELL'
+            pos_side = 'SHORT'
+            tp_price = round(price * (1 - PROFIT_PERCENT), 6)
+            sl_price = round(price * (1 + LOSS_PERCENT), 6)
+            close_side = 'BUY'
+
+        params = {'symbol': symbol, 'side': side, 'type': 'MARKET', 'quantity': qty}
+        if hedge_mode:
+            params['positionSide'] = pos_side
+        client.futures_create_order(**params)
+        print(f"\n[KHỚP LỆNH] {direction} {symbol} | Lev {lev}x | Giá {price:.6f} | Qty {qty} | Margin ≈ {effective_margin:.2f}U")
+
+        tp_ok = sl_ok = False
+        for _ in range(3):
+            if not tp_ok:
+                try:
+                    p = {
+                        'symbol': symbol, 'side': close_side, 'type': 'TAKE_PROFIT_MARKET',
+                        'stopPrice': tp_price, 'closePosition': True, 'workingType': 'CONTRACT_PRICE'
+                    }
+                    if hedge_mode:
+                        p['positionSide'] = pos_side
+                    client.futures_create_order(**p)
+                    tp_ok = True
+                except:
+                    time.sleep(0.3)
+
+            if not sl_ok:
+                try:
+                    p = {
+                        'symbol': symbol, 'side': close_side, 'type': 'STOP_MARKET',
+                        'stopPrice': sl_price, 'closePosition': True, 'workingType': 'CONTRACT_PRICE'
+                    }
+                    if hedge_mode:
+                        p['positionSide'] = pos_side
+                    client.futures_create_order(**p)
+                    sl_ok = True
+                except:
+                    time.sleep(0.3)
+
+            if tp_ok and sl_ok:
+                break
+
+        if not (tp_ok and sl_ok):
+            print(f"   [CẢNH BÁO] Không đặt được TP/SL → Đóng {symbol} ngay!")
+            try:
+                close_p = {'symbol': symbol, 'side': close_side, 'type': 'MARKET', 'quantity': qty, 'reduceOnly': True}
+                if hedge_mode:
+                    close_p['positionSide'] = pos_side
+                client.futures_create_order(**close_p)
+            except:
+                pass
+            return False
+
+        print(f" → TP: {tp_price} | SL: {sl_price} (OK)")
+        LAST_TRADE_TIME[symbol] = time.time()
+        return True
+
+    except BinanceAPIException as e:
+        if e.code != -2019:
+            print(f"[LỖI MỞ LỆNH] {symbol}: {e}")
+        return False
+    except Exception as e:
+        print(f"[LỖI] {symbol}: {e}")
+        return False
+
+
+def manage_break_even(client, hedge_mode):
+    try:
+        positions = client.futures_position_information()
+        for p in positions:
+            amt = float(p['positionAmt'])
+            if amt == 0:
+                continue
+            symbol = p['symbol']
+            entry = float(p['entryPrice'])
+            mark = float(p['markPrice'])
+            pnl_pct = (mark - entry) / entry if amt > 0 else (entry - mark) / entry
+            if pnl_pct < BREAK_EVEN_TRIGGER:
+                continue
+
+            try:
+                for o in client.futures_get_open_orders(symbol=symbol):
+                    if o['type'] in ('STOP_MARKET', 'STOP'):
+                        client.futures_cancel_order(symbol=symbol, orderId=o['orderId'])
+            except:
+                pass
+
+            close_side = 'SELL' if amt > 0 else 'BUY'
+            pos_side = 'LONG' if amt > 0 else 'SHORT'
+            be_price = round(entry * (1.0006 if amt > 0 else 0.9994), 6)
+
+            params = {
+                'symbol': symbol, 'side': close_side, 'type': 'STOP_MARKET',
+                'stopPrice': be_price, 'closePosition': True, 'workingType': 'CONTRACT_PRICE'
             }
-        }
-        let signature = generateSignature(queryString, SECRET_KEY);
-        url += `?${queryString}&signature=${signature}`;
-    } else if (payload) {
-        let queryArr = [];
-        for (let key in payload) {
-            queryArr.push(`${key}=${encodeURIComponent(payload[key])}`);
-        }
-        if (queryArr.length > 0) {
-            url += `?${queryArr.join('&')}`;
-        }
-    }
+            if hedge_mode:
+                params['positionSide'] = pos_side
+            try:
+                client.futures_create_order(**params)
+                print(f"   [BREAK-EVEN] {symbol} → SL về {be_price}")
+            except:
+                pass
+    except:
+        pass
 
-    let options = { method, headers };
 
-    for (let attempt = 1; attempt <= 3; attempt++) {
-        try {
-            let response = await fetch(url, options);
-            
-            // KIỂM TRA MÃ LỖI HTTP TRẢ VỀ TỪ BINANCE
-            if (!response.ok) {
-                let errText = await response.text();
-                console.log(`⚠️ API ${endpoint} trả về lỗi HTTP ${response.status}: ${errText}`);
-                return null;
-            }
+# ==========================================
+# 5. STATUS
+# ==========================================
+def print_status(client):
+    try:
+        balances = get_usdt_balances(client)
+        positions = client.futures_position_information()
+        active = [p for p in positions if float(p['positionAmt']) != 0]
+        active_symbols = []
 
-            let data = await response.json();
-            return data;
-        } catch (error) {
-            console.log(`⚠️ Lỗi ngoại lệ khi gọi ${endpoint} (Lần thử ${attempt}/3):`, error.message);
-            if (attempt === 3) {
-                return null;
-            }
-            await new Promise(resolve => setTimeout(resolve, 1000));
-        }
-    }
-    return null;
-}
+        print(f"[VÍ] Tổng USDT: {balances['wallet']:.2f} | Available: {balances['available']:.2f} | Unrealized: {balances['unrealized']:+.2f}")
+        print(f"[STATUS] Lệnh mở: {len(active)}/{MAX_ACTIVE_TRADES} | Mode: {TRADE_MODE}")
 
-// Tính toán chỉ báo RSI
-function calculateRSI(closes, period = 14) {
-    if (closes.length < period + 1) return 50;
-    let gains = 0;
-    let losses = 0;
+        if not active:
+            print("   (Không có vị thế)")
+            return []
 
-    for (let i = 1; i <= period; i++) {
-        let change = closes[closes.length - i] - closes[closes.length - i - 1];
-        if (change > 0) gains += change;
-        else losses -= change;
-    }
+        total_pnl = 0.0
+        print("   ────────── VỊ THẾ ĐANG MỞ ──────────")
+        for p in active:
+            symbol = p['symbol']
+            amt = float(p['positionAmt'])
+            entry = float(p['entryPrice'])
+            mark = float(p['markPrice'])
+            pnl = float(p['unRealizedProfit'])
+            lev = p.get('leverage', '?')
+            direction = "LONG" if amt > 0 else "SHORT"
+            emoji = "🟢" if pnl >= 0 else "🔴"
+            print(f"   {emoji} {symbol} {direction} | Entry: {entry:.6f} | Mark: {mark:.6f} | PnL: {pnl:+.4f}U | Lev: {lev}x")
+            total_pnl += pnl
+            active_symbols.append(symbol)
+        print(f"   Tổng Unrealized: {total_pnl:+.4f} USDT")
+        return active_symbols
+    except Exception as e:
+        print(f"[LỖI STATUS] {e}")
+        return []
 
-    let avgGain = gains / period;
-    let avgLoss = losses / period;
-    if (avgLoss === 0) return 100;
-    let rs = avgGain / avgLoss;
-    return 100 - (100 / (1 + rs));
-}
 
-// Lấy dữ liệu nến (Kline)
-async function getKlineData(symbol, interval, limit) {
-    let endpoint = `/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
-    let data = await callBinanceAPI(endpoint, 'GET', null, false);
-    if (!Array.isArray(data)) return [];
+def clean_orphan_orders(client, active_symbols):
+    try:
+        for o in client.futures_get_open_orders():
+            if o['symbol'] not in active_symbols:
+                client.futures_cancel_all_open_orders(symbol=o['symbol'])
+                print(f"[CLEANUP] Hủy lệnh thừa {o['symbol']}")
+    except:
+        pass
 
-    return data.map(k => ({
-        openTime: k[0],
-        open: parseFloat(k[1]),
-        high: parseFloat(k[2]),
-        low: parseFloat(k[3]),
-        close: parseFloat(k[4]),
-        volume: parseFloat(k[5])
-    }));
-}
 
-// ==================== HÀM CHÍNH CHẠY BOT ====================
-async function runBot() {
-    try {
-        console.log("\n==================== BẮT ĐẦU VÒNG QUÉT MỚI ====================");
+# ==========================================
+# 6. VÒNG LẶP CHÍNH - QUÉT TOP TĂNG/GIẢM
+# ==========================================
+def run_bot():
+    client = Client(API_KEY, API_SECRET, testnet=USE_TESTNET)
+    load_symbol_precisions(client)
+    hedge = is_hedge_mode(client)
 
-        // 1. Kiểm tra vị thế mở trên sàn
-        let positions = await callBinanceAPI("/fapi/v2/positionRisk", "GET", null, true);
-        if (Array.isArray(positions)) {
-            let activePositions = positions.filter(pos => parseFloat(pos.positionAmt) !== 0);
-            if (activePositions.length > 0) {
-                console.log("⚠️ Đang có vị thế mở trên sàn. Tạm dừng và kiểm tra lại sau 5 phút!");
-                scheduleNextRun(5 * 60 * 1000);
-                return;
-            }
-        }
+    print(f"Bot khởi động | Testnet: {USE_TESTNET} | Hedge: {hedge}")
+    time.sleep(1)
 
-        // 2. LẤY DANH SÁCH COIN (Ưu tiên gọi 24hr, nếu lỗi tự động dùng list dự phòng an toàn)
-        let tickers = await callBinanceAPI("/fapi/v1/ticker/24hr", "GET", null, false);
-        let candidates = [];
+    while True:
+        try:
+            clear_screen()
+            print("=" * 64)
+            print(f"BOT SUPER TREND | Mode: {TRADE_MODE} | Quét TOP TĂNG/GIẢM")
+            print(f"Entry: {ENTRY_INTERVAL} | HTF: {HTF_INTERVAL} | Margin: {MARGIN_PER_TRADE}U | Lev: {LEVERAGE}x")
+            print("=" * 64)
 
-        if (Array.isArray(tickers)) {
-            let usdtTickers = tickers.filter(t => 
-                t.symbol.endsWith("USDT") && 
-                !["USDCUSDT", "TUSDUSDT", "BUSDUSDT", "EURUSDT"].includes(t.symbol)
-            );
+            active_symbols = print_status(client)
+            clean_orphan_orders(client, active_symbols)
+            manage_break_even(client, hedge)
 
-            usdtTickers.sort((a, b) => parseFloat(b.priceChangePercent) - parseFloat(a.priceChangePercent));
+            if len(active_symbols) >= MAX_ACTIVE_TRADES:
+                print(f"\n[THÔNG BÁO] Đã đủ {MAX_ACTIVE_TRADES} lệnh.")
+            else:
+                balances = get_usdt_balances(client)
+                if balances['available'] >= MARGIN_PER_TRADE:
+                    tickers = client.futures_ticker()
+                    candidates = []
 
-            let topGainers = usdtTickers.slice(0, 5);
-            let topLosers = usdtTickers.slice(-5).reverse();
-            candidates = [...topGainers, ...topLosers];
+                    for t in tickers:
+                        sym = t['symbol']
+                        if (sym.endswith('USDT') and
+                            not any(sym.startswith(x) for x in ['USDC', 'TUSD', 'BUSD', 'EUR', 'GBP', 'USDP']) and
+                            float(t['quoteVolume']) > 5_000_000):   # volume tối thiểu
 
-            console.log("📊 Lấy thành công top biến động từ sàn:");
-            console.log("🟢 Top Tăng:", topGainers.map(x => `${x.symbol} (${x.priceChangePercent}%)`).join(", "));
-            console.log("🔴 Top Giảm:", topLosers.map(x => `${x.symbol} (${x.priceChangePercent}%)`).join(", "));
-        } else {
-            console.log("⚠️ Không lấy được ticker 24h (Do IP Render bị hạn chế hoặc nghẽn mạng). Chuyển sang danh sách coin top thanh khoản cố định để quét liên tục...");
-            let fallbackList = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "SUIUSDT", "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT"];
-            candidates = fallbackList.map(s => ({ symbol: s }));
-        }
+                            change = abs(float(t['priceChangePercent']))
+                            if change >= 0.8:                      # chỉ lấy coin có biến động
+                                candidates.append(t)
 
-        // 3. PHÂN TÍCH CHỈ BÁO KỸ THUẬT
-        console.log("🔍 Đang tiến hành phân tích chỉ báo (RSI, Volume, Trend) cho danh sách...");
+                    # Sắp xếp theo biến động mạnh nhất (tăng hoặc giảm)
+                    candidates = sorted(candidates,
+                                        key=lambda x: abs(float(x['priceChangePercent'])),
+                                        reverse=True)[:40]          # Lấy top 30
 
-        let bestTarget = null;
-        let scoreBest = -999;
+                    print(f"\n[QUÉT TOP TĂNG/GIẢM] Đang kiểm tra {len(candidates)} coin biến động mạnh nhất...")
+                    found = 0
+                    checked = 0
 
-        for (let item of candidates) {
-            let symbol = item.symbol;
+                    for t in candidates:
+                        if len(active_symbols) >= MAX_ACTIVE_TRADES:
+                            break
+                        symbol = t['symbol']
+                        if symbol in active_symbols:
+                            continue
+                        if get_usdt_balances(client)['available'] < MARGIN_PER_TRADE:
+                            break
 
-            let klines5m = await getKlineData(symbol, "5m", 30);
-            let klines1h = await getKlineData(symbol, "1h", 20);
-            let klines1d = await getKlineData(symbol, "1d", 10);
+                        checked += 1
+                        direction = decide_direction(client, symbol)
+                        if direction:
+                            success = open_position(client, symbol, direction, hedge)
+                            if success:
+                                active_symbols.append(symbol)
+                                found += 1
+                            time.sleep(0.55)
 
-            if (klines5m.length < 20 || klines1h.length < 15) continue;
+                    print(f"   → Đã kiểm tra {checked} coin | Tìm thấy {found} tín hiệu")
 
-            let closes5m = klines5m.map(k => k.close);
-            let rsi5m = calculateRSI(closes5m, 14);
+            print("\n[ĐANG CHỜ] Quét lại sau 5 giây...")
+            time.sleep(5)
 
-            let recentVol = klines5m[klines5m.length - 1].volume;
-            let avgVol = (klines5m[klines5m.length - 2].volume + klines5m[klines5m.length - 3].volume + klines5m[klines5m.length - 4].volume) / 3;
-            let isVolumeConfirmed = recentVol > (avgVol * 1.2);
+        except Exception as e:
+            print(f"[LỖI SYSTEM] {e}")
+            time.sleep(6)
 
-            let trend1h = klines1h[klines1h.length - 1].close > klines1h[klines1h.length - 5].close ? "UP" : "DOWN";
-            let trend1d = klines1d.length > 3 ? (klines1d[klines1d.length - 1].close > klines1d[klines1d.length - 2].close ? "UP" : "DOWN") : "UP";
 
-            let currentScore = 0;
-            let suggestedAction = "";
-
-            if (rsi5m < 40 && (trend1h === "UP" || trend1d === "UP") && isVolumeConfirmed) {
-                suggestedAction = "BUY";
-                currentScore = (50 - rsi5m) + (recentVol / avgVol);
-            } else if (rsi5m > 60 && (trend1h === "DOWN" || trend1d === "DOWN") && isVolumeConfirmed) {
-                suggestedAction = "SELL";
-                currentScore = (rsi5m - 50) + (recentVol / avgVol);
-            }
-
-            if (suggestedAction && currentScore > scoreBest) {
-                scoreBest = currentScore;
-                bestTarget = { symbol, action: suggestedAction, currentPrice: closes5m[closes5m.length - 1], rsi: rsi5m };
-            }
-        }
-
-        // 4. XỬ LÝ KẾT QUẢ TÌM KIẾM
-        if (!bestTarget) {
-            console.log("📭 Chưa tìm thấy mã nào thỏa mãn tín hiệu. Sẽ quét lại liên tục sau 15 giây...");
-            scheduleNextRun(15 * 1000); // Tự động quét lại sau 15 giây
-            return;
-        }
-
-        console.log(`🎯 TÌM THẤY TÍN HIỆU: ${bestTarget.symbol} | Hướng: ${bestTarget.action} | Giá: ${bestTarget.currentPrice} | RSI: ${bestTarget.rsi.toFixed(2)}`);
-
-        // 5. Kiểm tra ví và vào lệnh
-        let account = await callBinanceAPI("/fapi/v2/account", "GET", null, true);
-        let usdtWallet = 0;
-        if (account && account.assets) {
-            let usdtAsset = account.assets.find(a => a.asset === "USDT");
-            if (usdtAsset) usdtWallet = parseFloat(usdtAsset.availableBalance);
-        }
-
-        console.log(`💰 SỐ DƯ VÍ USDT: ${usdtWallet.toFixed(2)} USDT`);
-        if (usdtWallet <= 10) {
-            console.log("❌ Số dư ví dưới 10 USDT. Chờ kiểm tra lại sau 5 phút.");
-            scheduleNextRun(5 * 60 * 1000);
-            return;
-        }
-
-        let { symbol, action: side, currentPrice } = bestTarget;
-        let allocationPercent = (side === "BUY") ? 0.95 : 0.50; 
-        let leverage = 1; 
-        let capitalToUse = usdtWallet * allocationPercent * leverage;
-        let quantity = parseFloat((capitalToUse / currentPrice).toFixed(3));
-        let tpPrice = (side === "BUY") ? currentPrice * 1.02 : currentPrice * 0.98; 
-
-        console.log("==================== THỰC THI KHỚP LỆNH ====================");
-        console.log(`💼 Vốn phân bổ: ${capitalToUse.toFixed(2)} USDT | Khối lượng: {quantity} | TP: ${tpPrice.toFixed(4)}`);
-
-        let orderPayload = { symbol, side, type: "MARKET", quantity };
-        let marketRes = await callBinanceAPI("/fapi/v1/order", "POST", orderPayload, true);
-        console.log("✅ Kết quả Market Order:", JSON.stringify(marketRes));
-
-        let tpSide = (side === "BUY") ? "SELL" : "BUY";
-        let tpPayload = { symbol, side: tpSide, type: "TAKE_PROFIT_MARKET", stopPrice: tpPrice.toFixed(4), closePosition: "true" };
-        let tpRes = await callBinanceAPI("/fapi/v1/order", "POST", tpPayload, true);
-        console.log("✅ Kết quả Take Profit:", JSON.stringify(tpRes));
-        console.log("============================================================");
-
-        scheduleNextRun(5 * 60 * 1000);
-
-    } catch (error) {
-        console.log("❌ Lỗi hệ thống nghiêm trọng:", error.message);
-        scheduleNextRun(30 * 1000);
-    }
-}
-
-function scheduleNextRun(delayMs) {
-    setTimeout(runBot, delayMs);
-}
-
-console.log("🚀 Bot Binance Futures khởi động với cơ chế Log lỗi chi tiết...");
-runBot();
+if __name__ == "__main__":
+    run_bot()
