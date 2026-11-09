@@ -10,7 +10,7 @@ const BASE_URL = "https://fapi.binance.com";
 // TẠO HTTP SERVER BẮT ĐÚNG PORT CỦA RENDER (Tránh lỗi No open ports)
 const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Bot Binance Futures is running 24/7 with continuous scanning!\n');
+    res.end('Bot Binance Futures is running 24/7 with Top Gainers/Losers filtering!\n');
 });
 
 const PORT = process.env.PORT || 10000;
@@ -107,36 +107,50 @@ async function getKlineData(symbol, interval, limit) {
 // ==================== HÀM CHÍNH CHẠY BOT ====================
 async function runBot() {
     try {
-        console.log("\n==================== BẮT ĐẦU QUÉT VÀ LỌC THỊ TRƯỜNG ====================");
+        console.log("\n==================== BẮT ĐẦU VÒNG QUÉT MỚI ====================");
 
-        // 1. Kiểm tra lệnh treo
+        // 1. Kiểm tra xem có đang vướng lệnh nào không
         let positions = await callBinanceAPI("/fapi/v2/positionRisk", "GET", null, true);
         if (Array.isArray(positions)) {
             let activePositions = positions.filter(pos => parseFloat(pos.positionAmt) !== 0);
             if (activePositions.length > 0) {
-                console.log("⚠️ Đang có lệnh treo/vị thế mở trên sàn. Tạm dừng quét và kiểm tra lại sau 5 phút!");
+                console.log("⚠️ Đang có vị thế mở trên sàn. Tạm dừng và kiểm tra lại sau 5 phút!");
                 scheduleNextRun(5 * 60 * 1000);
                 return;
             }
         }
 
-        // 2. LẤY TOP BIẾN ĐỘNG HOẶC DÙNG DANH SÁCH DỰ PHÒNG AN TOÀN
+        // 2. BƯỚC 1: LẤY TOP 5 TĂNG & TOP 5 GIẢM TRƯỚC
         let tickers = await callBinanceAPI("/fapi/v1/ticker/24hr", "GET", null, false);
         let candidates = [];
 
         if (Array.isArray(tickers)) {
-            let usdtTickers = tickers.filter(t => t.symbol.endsWith("USDT"));
+            // Lọc chỉ lấy cặp USDT, loại bỏ stablecoin/coin phái sinh phụ
+            let usdtTickers = tickers.filter(t => 
+                t.symbol.endsWith("USDT") && 
+                !["USDCUSDT", "TUSDUSDT", "BUSDUSDT", "EURUSDT"].includes(t.symbol)
+            );
+
+            // Sắp xếp theo phần trăm thay đổi giá giảm dần (từ cao xuống thấp)
             usdtTickers.sort((a, b) => parseFloat(b.priceChangePercent) - parseFloat(a.priceChangePercent));
 
+            // Lấy đúng Top 5 Tăng mạnh nhất và Top 5 Giảm mạnh nhất
             let topGainers = usdtTickers.slice(0, 5);
             let topLosers = usdtTickers.slice(-5).reverse();
+            
             candidates = [...topGainers, ...topLosers];
-            console.log(`🔍 Đã lấy thành công ${candidates.length} đồng coin biến động mạnh để phân tích...`);
+
+            console.log("📊 Đã lọc thành công 10 đồng coin biến động mạnh nhất:");
+            console.log("🟢 Top 5 Tăng:", topGainers.map(x => `${x.symbol} (${x.priceChangePercent}%)`).join(", "));
+            console.log("🔴 Top 5 Giảm:", topLosers.map(x => `${x.symbol} (${x.priceChangePercent}%)`).join(", "));
         } else {
-            console.log("⚠️ Không lấy được ticker 24h, chuyển sang dùng danh sách dự phòng...");
-            let fallbackList = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "AVAXUSDT"];
+            console.log("⚠️ Không lấy được dữ liệu ticker 24h từ Binance, dùng danh sách dự phòng...");
+            let fallbackList = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"];
             candidates = fallbackList.map(s => ({ symbol: s }));
         }
+
+        // 3. BƯỚC 2: TIẾN HÀNH LỌC CHỈ BÁO TRÊN 10 COIN NÀY
+        console.log("🔍 Đang tiến hành phân tích chỉ báo (RSI, Volume, Trend) cho danh sách trên...");
 
         let bestTarget = null;
         let scoreBest = -999;
@@ -177,16 +191,16 @@ async function runBot() {
             }
         }
 
-        // 3. XỬ LÝ KẾT QUẢ & CƠ CHẾ QUÉT LIÊN TỤC
+        // 4. XỬ LÝ KẾT QUẢ TÌM KIẾM
         if (!bestTarget) {
-            console.log("📭 Không tìm thấy đồng coin nào thỏa mãn tín hiệu. Sẽ quét lại liên tục sau 15 giây...");
-            scheduleNextRun(15 * 1000); // Tự động quét lại sau 15 giây nếu chưa có cơ hội
+            console.log("📭 10 coin vừa lọc không có mã nào thỏa mãn tín hiệu kỹ thuật. Sẽ quét lại sau 15 giây...");
+            scheduleNextRun(15 * 1000); // Quét lại liên tục sau 15 giây
             return;
         }
 
-        console.log(`🎯 TÌM THẤY COIN: ${bestTarget.symbol} | Hướng: ${bestTarget.action} | Giá: ${bestTarget.currentPrice} | RSI: ${bestTarget.rsi.toFixed(2)}`);
+        console.log(`🎯 TÌM THẤY TÍN HIỆU: ${bestTarget.symbol} | Hướng: ${bestTarget.action} | Giá: ${bestTarget.currentPrice} | RSI: ${bestTarget.rsi.toFixed(2)}`);
 
-        // 4. Kiểm tra số dư ví USDT và tiến hành khớp lệnh
+        // 5. Kiểm tra ví và vào lệnh
         let account = await callBinanceAPI("/fapi/v2/account", "GET", null, true);
         let usdtWallet = 0;
         if (account && account.assets) {
@@ -196,7 +210,7 @@ async function runBot() {
 
         console.log(`💰 SỐ DƯ VÍ USDT: ${usdtWallet.toFixed(2)} USDT`);
         if (usdtWallet <= 10) {
-            console.log("❌ Số dư quá thấp (<= 10 USDT). Chờ kiểm tra lại sau 5 phút.");
+            console.log("❌ Số dư ví dưới 10 USDT. Chờ kiểm tra lại sau 5 phút.");
             scheduleNextRun(5 * 60 * 1000);
             return;
         }
@@ -211,32 +225,27 @@ async function runBot() {
         console.log("==================== THỰC THI KHỚP LỆNH ====================");
         console.log(`💼 Vốn phân bổ: ${capitalToUse.toFixed(2)} USDT | Khối lượng: ${quantity} | TP: ${tpPrice.toFixed(4)}`);
 
-        // Đặt lệnh Market
         let orderPayload = { symbol, side, type: "MARKET", quantity };
         let marketRes = await callBinanceAPI("/fapi/v1/order", "POST", orderPayload, true);
         console.log("✅ Kết quả Market Order:", JSON.stringify(marketRes));
 
-        // Đặt lệnh Take Profit (TP 2%)
         let tpSide = (side === "BUY") ? "SELL" : "BUY";
         let tpPayload = { symbol, side: tpSide, type: "TAKE_PROFIT_MARKET", stopPrice: tpPrice.toFixed(4), closePosition: "true" };
         let tpRes = await callBinanceAPI("/fapi/v1/order", "POST", tpPayload, true);
         console.log("✅ Kết quả Take Profit:", JSON.stringify(tpRes));
         console.log("============================================================");
 
-        // Sau khi vào lệnh thành công, chờ 5 phút cho chu kỳ tiếp theo
         scheduleNextRun(5 * 60 * 1000);
 
     } catch (error) {
         console.log("❌ Lỗi hệ thống:", error.message);
-        scheduleNextRun(30 * 1000); // Lỗi ngoại lệ thì thử lại sau 30 giây
+        scheduleNextRun(30 * 1000);
     }
 }
 
-// Hàm quản lý thời gian chờ thông minh
 function scheduleNextRun(delayMs) {
     setTimeout(runBot, delayMs);
 }
 
-// Khởi động bot lần đầu tiên
-console.log("🚀 Bot Binance Futures đã khởi động hoàn tất...");
+console.log("🚀 Bot Binance Futures khởi động với quy trình: Lọc Top 10 (5 Tăng + 5 Giảm) -> Quét Chỉ Báo...");
 runBot();
