@@ -1,0 +1,12 @@
+{
+  "name": "binance-futures-bot",
+  "version": "1.0.0",
+  "description": "Automated Binance Futures Trading Bot",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "node-fetch": "^2.6.7"
+  }
+}
