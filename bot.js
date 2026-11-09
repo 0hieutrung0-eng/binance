@@ -10,7 +10,7 @@ const BASE_URL = "https://fapi.binance.com";
 // TẠO HTTP SERVER BẮT ĐÚNG PORT CỦA RENDER (Tránh lỗi No open ports)
 const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Bot Binance Futures is running 24/7 with Top Gainers/Losers filtering!\n');
+    res.end('Bot Binance Futures is running 24/7 with detailed error logs!\n');
 });
 
 const PORT = process.env.PORT || 10000;
@@ -26,7 +26,7 @@ function generateSignature(queryString, secretKey) {
         .digest('hex');
 }
 
-// Hàm gọi API Binance có cơ chế thử lại (Retry)
+// Hàm gọi API Binance có log lỗi chi tiết HTTP Status
 async function callBinanceAPI(endpoint, method = 'GET', payload = null, isSigned = false) {
     let url = BASE_URL + endpoint;
     let headers = { "X-MBX-APIKEY": API_KEY };
@@ -56,11 +56,19 @@ async function callBinanceAPI(endpoint, method = 'GET', payload = null, isSigned
     for (let attempt = 1; attempt <= 3; attempt++) {
         try {
             let response = await fetch(url, options);
+            
+            // KIỂM TRA MÃ LỖI HTTP TRẢ VỀ TỪ BINANCE
+            if (!response.ok) {
+                let errText = await response.text();
+                console.log(`⚠️ API ${endpoint} trả về lỗi HTTP ${response.status}: ${errText}`);
+                return null;
+            }
+
             let data = await response.json();
             return data;
         } catch (error) {
+            console.log(`⚠️ Lỗi ngoại lệ khi gọi ${endpoint} (Lần thử ${attempt}/3):`, error.message);
             if (attempt === 3) {
-                console.log(`⚠️ Lỗi gọi API ${endpoint} sau 3 lần thử:`, error.message);
                 return null;
             }
             await new Promise(resolve => setTimeout(resolve, 1000));
@@ -109,7 +117,7 @@ async function runBot() {
     try {
         console.log("\n==================== BẮT ĐẦU VÒNG QUÉT MỚI ====================");
 
-        // 1. Kiểm tra xem có đang vướng lệnh nào không
+        // 1. Kiểm tra vị thế mở trên sàn
         let positions = await callBinanceAPI("/fapi/v2/positionRisk", "GET", null, true);
         if (Array.isArray(positions)) {
             let activePositions = positions.filter(pos => parseFloat(pos.positionAmt) !== 0);
@@ -120,37 +128,33 @@ async function runBot() {
             }
         }
 
-        // 2. BƯỚC 1: LẤY TOP 5 TĂNG & TOP 5 GIẢM TRƯỚC
+        // 2. LẤY DANH SÁCH COIN (Ưu tiên gọi 24hr, nếu lỗi tự động dùng list dự phòng an toàn)
         let tickers = await callBinanceAPI("/fapi/v1/ticker/24hr", "GET", null, false);
         let candidates = [];
 
         if (Array.isArray(tickers)) {
-            // Lọc chỉ lấy cặp USDT, loại bỏ stablecoin/coin phái sinh phụ
             let usdtTickers = tickers.filter(t => 
                 t.symbol.endsWith("USDT") && 
                 !["USDCUSDT", "TUSDUSDT", "BUSDUSDT", "EURUSDT"].includes(t.symbol)
             );
 
-            // Sắp xếp theo phần trăm thay đổi giá giảm dần (từ cao xuống thấp)
             usdtTickers.sort((a, b) => parseFloat(b.priceChangePercent) - parseFloat(a.priceChangePercent));
 
-            // Lấy đúng Top 5 Tăng mạnh nhất và Top 5 Giảm mạnh nhất
             let topGainers = usdtTickers.slice(0, 5);
             let topLosers = usdtTickers.slice(-5).reverse();
-            
             candidates = [...topGainers, ...topLosers];
 
-            console.log("📊 Đã lọc thành công 10 đồng coin biến động mạnh nhất:");
-            console.log("🟢 Top 5 Tăng:", topGainers.map(x => `${x.symbol} (${x.priceChangePercent}%)`).join(", "));
-            console.log("🔴 Top 5 Giảm:", topLosers.map(x => `${x.symbol} (${x.priceChangePercent}%)`).join(", "));
+            console.log("📊 Lấy thành công top biến động từ sàn:");
+            console.log("🟢 Top Tăng:", topGainers.map(x => `${x.symbol} (${x.priceChangePercent}%)`).join(", "));
+            console.log("🔴 Top Giảm:", topLosers.map(x => `${x.symbol} (${x.priceChangePercent}%)`).join(", "));
         } else {
-            console.log("⚠️ Không lấy được dữ liệu ticker 24h từ Binance, dùng danh sách dự phòng...");
-            let fallbackList = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"];
+            console.log("⚠️ Không lấy được ticker 24h (Do IP Render bị hạn chế hoặc nghẽn mạng). Chuyển sang danh sách coin top thanh khoản cố định để quét liên tục...");
+            let fallbackList = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "SUIUSDT", "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT"];
             candidates = fallbackList.map(s => ({ symbol: s }));
         }
 
-        // 3. BƯỚC 2: TIẾN HÀNH LỌC CHỈ BÁO TRÊN 10 COIN NÀY
-        console.log("🔍 Đang tiến hành phân tích chỉ báo (RSI, Volume, Trend) cho danh sách trên...");
+        // 3. PHÂN TÍCH CHỈ BÁO KỸ THUẬT
+        console.log("🔍 Đang tiến hành phân tích chỉ báo (RSI, Volume, Trend) cho danh sách...");
 
         let bestTarget = null;
         let scoreBest = -999;
@@ -193,8 +197,8 @@ async function runBot() {
 
         // 4. XỬ LÝ KẾT QUẢ TÌM KIẾM
         if (!bestTarget) {
-            console.log("📭 10 coin vừa lọc không có mã nào thỏa mãn tín hiệu kỹ thuật. Sẽ quét lại sau 15 giây...");
-            scheduleNextRun(15 * 1000); // Quét lại liên tục sau 15 giây
+            console.log("📭 Chưa tìm thấy mã nào thỏa mãn tín hiệu. Sẽ quét lại liên tục sau 15 giây...");
+            scheduleNextRun(15 * 1000); // Tự động quét lại sau 15 giây
             return;
         }
 
@@ -223,7 +227,7 @@ async function runBot() {
         let tpPrice = (side === "BUY") ? currentPrice * 1.02 : currentPrice * 0.98; 
 
         console.log("==================== THỰC THI KHỚP LỆNH ====================");
-        console.log(`💼 Vốn phân bổ: ${capitalToUse.toFixed(2)} USDT | Khối lượng: ${quantity} | TP: ${tpPrice.toFixed(4)}`);
+        console.log(`💼 Vốn phân bổ: ${capitalToUse.toFixed(2)} USDT | Khối lượng: {quantity} | TP: ${tpPrice.toFixed(4)}`);
 
         let orderPayload = { symbol, side, type: "MARKET", quantity };
         let marketRes = await callBinanceAPI("/fapi/v1/order", "POST", orderPayload, true);
@@ -238,7 +242,7 @@ async function runBot() {
         scheduleNextRun(5 * 60 * 1000);
 
     } catch (error) {
-        console.log("❌ Lỗi hệ thống:", error.message);
+        console.log("❌ Lỗi hệ thống nghiêm trọng:", error.message);
         scheduleNextRun(30 * 1000);
     }
 }
@@ -247,5 +251,5 @@ function scheduleNextRun(delayMs) {
     setTimeout(runBot, delayMs);
 }
 
-console.log("🚀 Bot Binance Futures khởi động với quy trình: Lọc Top 10 (5 Tăng + 5 Giảm) -> Quét Chỉ Báo...");
+console.log("🚀 Bot Binance Futures khởi động với cơ chế Log lỗi chi tiết...");
 runBot();
